@@ -1,0 +1,109 @@
+#!/bin/sh
+
+ARGS="$*"
+
+log() {
+	echo "$*"
+	logger -t "$0[$$]" "$*"
+}
+
+# Check if recoord is already latest in asuscomm server, 0 for latest, 1 for need update
+check_record() {
+	#curl -X POST -d "hostname=$HOSTNAME" "https://iplookup.asus.com/nslookup.php"
+	RECORD_CMD="curl -s -X POST -d \"hostname=$HOSTNAME\" \"https://iplookup.asus.com/nslookup.php\""
+	RECORD="$(echo "$(eval $RECORD_CMD)" | grep "Result" | awk -v RS="[ ,]+" 'BEGIN {print ""} {if (system("ip route get \"" $1 "/32\" >/dev/null 2>&1") == 0) print}')"
+	if [ "$(echo "$RECORD" | grep -cx "$IP")" != 1 ] || [ "$(echo "$RECORD" | grep -cx "$IPV6")" != 1 ]; then
+		return 1
+	fi
+	for ip in $RECORD; do
+		if [ "$ip" != "$IP" ] && [ "$ip" != "$IPV6" ]; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+# Set the host name, ending with .asuscomm.com is optional
+HOSTNAME="$(nvram get ddns_hostname_x | sed 's/\.asuscomm\.com$//')"
+
+PRODUCTID="$(nvram get productid)"
+
+INNERVER="$(nvram get innerver)"
+
+# The IP address to use
+if [ "$(nvram get ddns_realip_x)" == "0" ]; then
+	if ip -4 route get $1/32 >/dev/null 2>&1; then
+		IP="$1"
+	else
+		IP="$(nvram get wan_ipaddr | cut -d'/' -f1)"
+	fi
+	IPV6="$(nvram get ipv6_wan_addr | cut -d'/' -f1)"
+else
+	IP="$(curl -s https://api-ipv4.ip.sb/ip -A Mozilla)"
+	IPV6="$(curl -s https://api-ipv6.ip.sb/ip -A Mozilla)"
+fi
+
+# Asus DDNS server
+ASUS_SERVER='ns1.asuscomm.com'
+
+# Router MAC address location is hardware dependent
+for LAN_MAC_NAME in et0macaddr et1macaddr et2macaddr; do
+	MAC_ADDR="$(nvram get "$LAN_MAC_NAME")"
+	if [ -n "$MAC_ADDR" ] && [ "$MAC_ADDR" != '00:00:00:00:00:00' ]; then
+		break
+	fi
+done
+
+# Use openssl to generate the password
+PASSWORD="$(printf '%s' "${MAC_ADDR//:/}${IP//./}" | openssl md5 -hmac "$(nvram get secret_code)" 2>/dev/null | awk '{print toupper($2)}')"
+
+# Creat force update
+if [ "$(nvram get ddns_refresh_x)" != "0" ] && !(cru l | grep -q '#DDNSForceUpdate#'); then
+	cru a "DDNSForceUpdate" "29 6 */$(nvram get ddns_refresh_x) * * $0 --force"
+	log "creat force update cron job."
+fi
+
+# default nvram set le_acme_debug=0
+if [ "$(nvram get le_re_ddns)" == "1" ] || [ -f /tmp/acme.txt ]; then
+	log "ddns with acme challenge."
+	ACME_TXT="$(cat /tmp/acme.txt)"
+	if [ -n "$ACME_TXT" ]; then
+		ACME_TXT="&acme_challenge=1&txtdata=$ACME_TXT"
+	else
+		log "unable to get acme challenge txt."
+		/sbin/ddns_custom_updated 1
+		rm /tmp/acme.txt
+		exit 0
+	fi
+elif [ -n "$(echo " $ARGS " | grep ' --force ')" ]; then
+	log "force update."
+else
+	check_record && log "already latest." && /sbin/ddns_custom_updated 1 && exit 0
+fi
+
+if [ "$(nvram get ddns_ipv6_update)" == "1" ]; then
+	if ip -6 route get $IPV6/128 >/dev/null 2>&1; then
+		IPV6_TXT="&myipv6=$IPV6"
+	else
+		log "no ipv6 or get wrong ipv6 addr."
+	fi
+fi
+
+# Try to update
+UPDATE_CMD="curl -fs -w 'http_code:%{http_code}' -u \"${MAC_ADDR//:/}:$PASSWORD\" \"https://$ASUS_SERVER/ddns/update.jsp?hostname=$HOSTNAME.asuscomm.com&oldmac=${MAC_ADDR//:/}$ACME_TXT&myip=$IP$IPV6_TXT&model=$PRODUCTID&fw_ver=$INNERVER\""
+log "$UPDATE_CMD"
+HTTP_RESULT=$(eval "$UPDATE_CMD")
+HTTP_CODE="${HTTP_RESULT#*http_code:}"
+nvram set ddns_return_code=$HTTP_CODE
+
+# Full code list https://github.com/RMerl/asuswrt-merlin.ng/blob/24569f613492df9c1b428bece93af0f70d010fdc/release/src/router/inadyn/plugins/asuscomm.c#L387
+case "$HTTP_CODE" in
+	200|220|230)
+		log "succeeded with $HTTP_RESULT."
+		/sbin/ddns_custom_updated 1
+	;;
+	*)
+		log "failed with $HTTP_RESULT."
+		/sbin/ddns_custom_updated 0
+	;;
+esac
